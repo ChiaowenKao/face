@@ -54,7 +54,7 @@
     <label>D1 mini 開門網址</label>
     <input type="text" id="url" placeholder="https://192.168.43.12/open">
     <button id="btnTest" class="gray">先開一次這個網址（第一次要按「繼續前往」）</button>
-    <div class="small">辨識成功時，會自動送出這個網址給 D1 mini，冷卻 10 秒後才會再送。</div>
+    <div class="small">辨識成功時，網頁會自動切換到這個網址讓 D1 mini 開門，幾秒後再跳回來。</div>
   </div>
 </main>
 
@@ -160,9 +160,11 @@ function openDoor() {
   const url = $('url').value.trim();
   if (!url || Date.now() - lastOpen < COOLDOWN_MS) return;
   lastOpen = Date.now();
-  fetch(url, { mode: 'no-cors' })
-    .then(() => setStatus('🚪 已送出開門指令'))
-    .catch(() => setStatus('⚠️ 送不到 D1 mini：請先按「先開一次這個網址」並按「繼續前往」'));
+  running = false;
+  setStatus('🚪 辨識成功，前往 D1 mini 開門…');
+  // 直接把整頁切換到 D1 mini 的網址（Chrome 不會擋這種「換頁」），
+  // D1 mini 回傳的網頁會在幾秒後自動跳回這裡。
+  setTimeout(() => { location.href = url; }, 800);
 }
 $('btnTest').onclick = () => {
   const url = $('url').value.trim();
