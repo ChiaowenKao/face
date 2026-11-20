@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>刷臉開門｜是不是本人？</title>
+<style>
+  body { font-family: system-ui, "Noto Sans TC", sans-serif; margin: 0; background: #f4f5f7; color: #222; }
+  main { max-width: 480px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 22px; margin: 4px 0 12px; }
+  .card { background: #fff; border-radius: 12px; padding: 14px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .card h2 { font-size: 16px; margin: 0 0 8px; }
+  #videoBox { position: relative; width: 100%; aspect-ratio: 3/4; background: #000; border-radius: 12px; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  #result { font-size: 26px; font-weight: bold; text-align: center; padding: 14px; border-radius: 12px; margin: 12px 0; background: #ddd; }
+  #result.yes { background: #c8f7c5; color: #11621a; }
+  #result.no  { background: #ffd2d2; color: #8a1111; }
+  button { font-size: 17px; padding: 12px; border: 0; border-radius: 10px; width: 100%; margin-top: 8px; background: #1f6feb; color: #fff; }
+  button.gray { background: #8b949e; }
+  button:disabled { opacity: .45; }
+  input[type=text] { font-size: 16px; padding: 10px; width: 100%; box-sizing: border-box; border: 1px solid #ccc; border-radius: 8px; }
+  label { display: block; font-size: 14px; margin: 8px 0 4px; }
+  #status { font-size: 14px; color: #555; min-height: 20px; }
+  .small { font-size: 13px; color: #666; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🔐 刷臉開門：是不是本人？</h1>
+  <div id="status">載入中…</div>
+
+  <div id="videoBox"><video id="video" autoplay muted playsinline></video></div>
+  <div id="result">尚未開始</div>
+
+  <div class="card">
+    <h2>① 登錄本人的臉</h2>
+    <label>你的名字</label>
+    <input type="text" id="name" placeholder="例如 Tony">
+    <button id="btnEnroll" disabled>📸 拍照登錄（共 3 張）</button>
+    <div class="small" id="enrollInfo">尚未登錄</div>
+    <button id="btnClear" class="gray">清除登錄資料</button>
+  </div>
+
+  <div class="card">
+    <h2>② 開始辨識</h2>
+    <button id="btnStart" disabled>▶️ 開始辨識</button>
+    <label>嚴格程度（數字越小越嚴格）：<b id="thVal">0.45</b></label>
+    <input type="range" id="th" min="0.30" max="0.60" step="0.01" value="0.45" style="width:100%">
+    <div class="small">畫面上的「差異值」小於嚴格程度，連續 3 次，就判定是本人。</div>
+  </div>
+
+  <div class="card">
+    <h2>③ 連接 D1 mini（沒接硬體可以跳過）</h2>
+    <label>D1 mini 開門網址</label>
+    <input type="text" id="url" placeholder="https://192.168.43.12/open">
+    <button id="btnTest" class="gray">先開一次這個網址（第一次要按「繼續前往」）</button>
+    <div class="small">辨識成功時，會自動送出這個網址給 D1 mini，冷卻 10 秒後才會再送。</div>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/dist/face-api.js"></script>
+<script>
+const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/model/';
+const SHOTS = 3;          // 登錄要拍幾張
+const NEED_HITS = 3;      // 連續幾次符合才算本人
+const COOLDOWN_MS = 10000;
+
+const $ = id => document.getElementById(id);
+const video = $('video'), statusEl = $('status'), resultEl = $('result');
+let enrolled = [];        // 已登錄的臉部特徵（每張 128 個數字）
+let running = false, hits = 0, lastOpen = 0;
+
+function setStatus(t) { statusEl.textContent = t; }
+function setResult(t, cls) { resultEl.textContent = t; resultEl.className = cls || ''; }
+
+// ---------- 讀取／儲存設定 ----------
+function load() {
+  $('name').value = localStorage.getItem('fl_name') || '';
+  $('url').value  = localStorage.getItem('fl_url')  || '';
+  try { enrolled = JSON.parse(localStorage.getItem('fl_faces') || '[]'); } catch (e) { enrolled = []; }
+  showEnroll();
+}
+function showEnroll() {
+  $('enrollInfo').textContent = enrolled.length
+    ? `已登錄 ${enrolled.length} 張（${$('name').value || '未命名'}）`
+    : '尚未登錄';
+  $('btnStart').disabled = enrolled.length === 0 || !modelsReady;
+}
+$('name').onchange = () => { localStorage.setItem('fl_name', $('name').value.trim()); showEnroll(); };
+$('url').onchange  = () => localStorage.setItem('fl_url', $('url').value.trim());
+$('th').oninput    = () => $('thVal').textContent = $('th').value;
+
+// ---------- 取得一張臉的特徵 ----------
+const detOpt = () => new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+async function getDescriptor() {
+  const r = await faceapi.detectSingleFace(video, detOpt()).withFaceLandmarks(true).withFaceDescriptor();
+  return r ? r.descriptor : null;
+}
+
+// ---------- ① 登錄 ----------
+$('btnEnroll').onclick = async () => {
+  if (!$('name').value.trim()) { alert('請先輸入名字'); return; }
+  localStorage.setItem('fl_name', $('name').value.trim());
+  $('btnEnroll').disabled = true;
+  const shots = [];
+  while (shots.length < SHOTS) {
+    setResult(`請看鏡頭… 第 ${shots.length + 1}/${SHOTS} 張`);
+    await new Promise(r => setTimeout(r, 800));
+    const d = await getDescriptor();
+    if (d) {
+      shots.push(Array.from(d));
+      setStatus(`✅ 第 ${shots.length} 張完成，請稍微轉一下頭`);
+    } else {
+      setStatus('⚠️ 沒找到臉：請靠近一點、臉放在畫面中間、光線亮一點');
+    }
+  }
+  enrolled = shots;
+  localStorage.setItem('fl_faces', JSON.stringify(enrolled));
+  setResult('登錄完成！可以開始辨識', 'yes');
+  $('btnEnroll').disabled = false;
+  showEnroll();
+};
+$('btnClear').onclick = () => {
+  enrolled = []; localStorage.removeItem('fl_faces');
+  running = false; $('btnStart').textContent = '▶️ 開始辨識';
+  setResult('已清除登錄資料'); showEnroll();
+};
+
+// ---------- ② 辨識 ----------
+$('btnStart').onclick = () => {
+  running = !running;
+  $('btnStart').textContent = running ? '⏸ 停止辨識' : '▶️ 開始辨識';
+  hits = 0;
+  if (running) loop(); else setResult('已停止');
+};
+async function loop() {
+  while (running) {
+    const d = await getDescriptor();
+    const th = parseFloat($('th').value);
+    const name = $('name').value || '本人';
+    if (!d) {
+      hits = 0; setResult('👀 看不到臉');
+    } else {
+      // 和每一張登錄照比較，取最小的差異值
+      const dist = Math.min(...enrolled.map(e => faceapi.euclideanDistance(d, e)));
+      if (dist < th) {
+        hits++;
+        if (hits >= NEED_HITS) { setResult(`✅ 是 ${name}！（差異值 ${dist.toFixed(2)}）`, 'yes'); openDoor(); }
+        else setResult(`確認中…（差異值 ${dist.toFixed(2)}）`);
+      } else {
+        hits = 0; setResult(`❌ 不是 ${name}（差異值 ${dist.toFixed(2)}）`, 'no');
+      }
+    }
+    await new Promise(r => setTimeout(r, 300));
+  }
+}
+
+// ---------- ③ 通知 D1 mini ----------
+function openDoor() {
+  const url = $('url').value.trim();
+  if (!url || Date.now() - lastOpen < COOLDOWN_MS) return;
+  lastOpen = Date.now();
+  fetch(url, { mode: 'no-cors' })
+    .then(() => setStatus('🚪 已送出開門指令'))
+    .catch(() => setStatus('⚠️ 送不到 D1 mini：請先按「先開一次這個網址」並按「繼續前往」'));
+}
+$('btnTest').onclick = () => {
+  const url = $('url').value.trim();
+  if (!url) { alert('請先輸入 D1 mini 開門網址'); return; }
+  localStorage.setItem('fl_url', url);
+  window.open(url, '_blank');
+};
+
+// ---------- 啟動：載入模型＋打開相機 ----------
+let modelsReady = false;
+async function init() {
+  load();
+  if (!window.isSecureContext) {
+    setStatus('⚠️ 這個網頁必須用 https:// 開啟，相機才能使用'); return;
+  }
+  if (typeof faceapi === 'undefined') {
+    setStatus('⚠️ 程式庫載入失敗：請確認手機有網路（行動數據或熱點）'); return;
+  }
+  try {
+    setStatus('下載 AI 模型中（第一次約 10～30 秒）…');
+    await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+    await faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL);
+    await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+    modelsReady = true;
+  } catch (e) {
+    setStatus('⚠️ 模型下載失敗：請確認網路後重新整理頁面'); console.error(e); return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+  } catch (e) {
+    setStatus('⚠️ 無法開啟相機：請允許相機權限，並用 Chrome 或 Safari 開啟'); console.error(e); return;
+  }
+  setStatus('✅ 準備完成');
+  $('btnEnroll').disabled = false;
+  showEnroll();
+  setResult(enrolled.length ? '可以開始辨識' : '請先登錄你的臉');
+}
+init();
+</script>
+</body>
+</html>
